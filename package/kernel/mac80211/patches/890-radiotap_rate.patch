@@ -1,0 +1,174 @@
+diff -urN compat-wireless-2014-05-22.old/include/net/mac80211.h compat-wireless-2014-05-22/include/net/mac80211.h
+--- compat-wireless-2014-05-22.old/include/net/mac80211.h	2014-05-23 19:32:18.000000000 +0200
++++ compat-wireless-2014-05-22/include/net/mac80211.h	2014-12-24 19:46:22.621211000 +0100
+@@ -512,11 +512,15 @@
+  *
+  * @IEEE80211_TX_CTRL_PORT_CTRL_PROTO: this frame is a port control
+  *	protocol frame (e.g. EAP)
++ * @IEEE80211_TX_CTL_NO_RC: This frame does not require rate control.
++ *     This flag is used when an injected frame includes a transmit
++ *     rate (and possibly flags and retry count) in the radiotap header.
+  *
+  * These flags are used in tx_info->control.flags.
+  */
+ enum mac80211_tx_control_flags {
+ 	IEEE80211_TX_CTRL_PORT_CTRL_PROTO	= BIT(0),
++	IEEE80211_TX_CTL_NO_RC			= BIT(1),
+ };
+ 
+ /*
+diff -urN compat-wireless-2014-05-22.old/net/mac80211/tx.c compat-wireless-2014-05-22/net/mac80211/tx.c
+--- compat-wireless-2014-05-22.old/net/mac80211/tx.c	2014-05-23 19:32:18.000000000 +0200
++++ compat-wireless-2014-05-22/net/mac80211/tx.c	2014-12-25 17:52:13.238867000 +0100
+@@ -1351,8 +1353,9 @@
+ 	CALL_TXH(ieee80211_tx_h_ps_buf);
+ 	CALL_TXH(ieee80211_tx_h_check_control_port_protocol);
+ 	CALL_TXH(ieee80211_tx_h_select_key);
+-	if (!(tx->local->hw.flags & IEEE80211_HW_HAS_RATE_CONTROL))
+-		CALL_TXH(ieee80211_tx_h_rate_ctrl);
++	if (!(tx->local->hw.flags & IEEE80211_HW_HAS_RATE_CONTROL) &&
++	    !(info->control.flags & IEEE80211_TX_CTL_NO_RC))
++ 		CALL_TXH(ieee80211_tx_h_rate_ctrl);
+ 
+ 	if (unlikely(info->flags & IEEE80211_TX_INTFL_RETRANSMISSION)) {
+ 		__skb_queue_tail(&tx->skbs, tx->skb);
+@@ -1530,7 +1533,8 @@
+ 	ieee80211_tx(sdata, skb, false, band);
+ }
+ 
+-static bool ieee80211_parse_tx_radiotap(struct sk_buff *skb)
++static bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
++					struct ieee80211_local *local)
+ {
+ 	struct ieee80211_radiotap_iterator iterator;
+ 	struct ieee80211_radiotap_header *rthdr =
+@@ -1538,10 +1542,19 @@
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	int ret = ieee80211_radiotap_iterator_init(&iterator, rthdr, skb->len,
+ 						   NULL);
++	struct ieee80211_supported_band *sband;
++	u8 fixed_rate[IEEE80211_TX_MAX_RATES] = { -1 };
++	u8 fixed_rate_data_retries[IEEE80211_TX_MAX_RATES] = { 0 };
++	u32 fixed_rate_flags[IEEE80211_TX_MAX_RATES] = { 0 };
+ 	u16 txflags;
++	u16 channelflags;
++	u16 channel;
++	u8 idx_rate = 0;
++	u8 idx_mcs = 0;
++	u8 idx_retries = 0;
+ 
+ 	info->flags |= IEEE80211_TX_INTFL_DONT_ENCRYPT |
+-		       IEEE80211_TX_CTL_DONTFRAG;
++			   IEEE80211_TX_CTL_DONTFRAG;
+ 
+ 	/*
+ 	 * for every radiotap entry that is present
+@@ -1583,12 +1596,45 @@
+ 				info->flags &= ~IEEE80211_TX_CTL_DONTFRAG;
+ 			break;
+ 
++		case IEEE80211_RADIOTAP_CHANNEL:		/* u16, u16 */
++			channel = get_unaligned((u16 *)iterator.this_arg);
++			channelflags = get_unaligned((u16 *)iterator.this_arg + 1);
++			break;
++
++		case IEEE80211_RADIOTAP_RATE:		/* u8 */
++			fixed_rate[idx_rate] = *iterator.this_arg;
++			idx_rate++;
++			break;
++
+ 		case IEEE80211_RADIOTAP_TX_FLAGS:
+ 			txflags = get_unaligned_le16(iterator.this_arg);
+ 			if (txflags & IEEE80211_RADIOTAP_F_TX_NOACK)
+ 				info->flags |= IEEE80211_TX_CTL_NO_ACK;
+ 			break;
+ 
++		case IEEE80211_RADIOTAP_DATA_RETRIES:	/* u8 */
++			fixed_rate_data_retries[idx_retries] = *iterator.this_arg;
++			idx_retries++;
++			break;
++
++		case IEEE80211_RADIOTAP_MCS: {		/* u8,u8,u8 */
++			u8 mcs_have = iterator.this_arg[0];
++			if (mcs_have & IEEE80211_RADIOTAP_MCS_HAVE_MCS) {
++				fixed_rate[idx_mcs] = iterator.this_arg[2];
++				fixed_rate_flags[idx_mcs] |= IEEE80211_TX_RC_MCS;
++			}
++			if ((mcs_have & IEEE80211_RADIOTAP_MCS_HAVE_GI) &&
++				(iterator.this_arg[1] & IEEE80211_RADIOTAP_MCS_SGI)) {
++				fixed_rate_flags[idx_mcs] |= IEEE80211_TX_RC_SHORT_GI;
++			}
++			if ((mcs_have & IEEE80211_RADIOTAP_MCS_HAVE_BW) &&
++				(iterator.this_arg[1] & IEEE80211_RADIOTAP_MCS_BW_40)) {
++				fixed_rate_flags[idx_mcs] |= IEEE80211_TX_RC_40_MHZ_WIDTH;
++			}
++			idx_mcs++;
++			break;
++		}
++
+ 		/*
+ 		 * Please update the file
+ 		 * Documentation/networking/mac80211-injection.txt
+@@ -1603,6 +1649,53 @@
+ 	if (ret != -ENOENT) /* ie, if we didn't simply run out of fields */
+ 		return false;
+ 
++	if (channelflags & IEEE80211_CHAN_2GHZ) {
++		sband = local->hw.wiphy->bands[IEEE80211_BAND_2GHZ];
++	}
++
++	if (channelflags & IEEE80211_CHAN_5GHZ) {
++		sband = local->hw.wiphy->bands[IEEE80211_BAND_5GHZ];
++	}
++
++	struct ieee80211_tx_rate *rates = info->control.rates;
++
++	int i;
++	for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
++		if (fixed_rate[i] == -1) {
++			int j;			
++			for (j = i; j < IEEE80211_TX_MAX_RATES; j++) {
++				rates[i].idx = -1;
++				rates[i].count = 0;
++				rates[i].flags = 0;
++			}
++			break;
++		}
++		if (fixed_rate_flags[i] & IEEE80211_TX_RC_MCS) {
++			WARN_ON(!sband->ht_cap.ht_supported);
++			rates[i].idx = fixed_rate[i];
++		} else {
++			/* convert legacy rate; NB: .5 Mb/s -> 100 kb/s */
++			int bitrate = fixed_rate[i]*5;
++			rates[i].idx = -1;  /* default to no rate */
++			int j;
++			for (j = 0; j < sband->n_bitrates; j++) {
++				if (bitrate == sband->bitrates[j].bitrate) {
++					rates[i].idx = j;
++					break;
++				}
++			}
++		}
++		if (rates[i].idx != -1) {
++			rates[i].count = fixed_rate_data_retries[i] + 1;
++			if (rates[i].count > local->hw.max_rate_tries) {
++				rates[i].count = local->hw.max_rate_tries;
++			}
++			rates[i].flags = fixed_rate_flags[i];
++		}
++	}
++
++	info->control.flags |= IEEE80211_TX_CTL_NO_RC;
++
+ 	/*
+ 	 * remove the radiotap header
+ 	 * iterator->_max_length was sanity-checked against
+@@ -1684,7 +1777,7 @@
+ 		      IEEE80211_TX_CTL_INJECTED;
+ 
+ 	/* process and remove the injection radiotap header */
+-	if (!ieee80211_parse_tx_radiotap(skb))
++	if (!ieee80211_parse_tx_radiotap(skb, local))
+ 		goto fail;
+ 
+ 	rcu_read_lock();
