@@ -12,13 +12,12 @@ DEFAULT_PACKAGES += \
 			kmod-i2c-scx200-acb \
 			kmod-usb-core kmod-usb2 kmod-usb2-pci kmod-usb-ohci \
 			kmod-cfg80211 kmod-mac80211 \
-			kmod-mppe kmod-pppoe kmod-pppol2tp \
-			kmod-ath5k kmod-ath9k \
+			kmod-ath9k \
 			kmod-leds-gpio kmod-input-gpio-keys-polled \
 			kmod-button-hotplug \
 			kmod-ledtrig-heartbeat kmod-ledtrig-gpio \
 			kmod-ledtrig-netdev \
-			kmod-cpu-msr hwclock wpad
+			kmod-cpu-msr hwclock wpad-mini
 CS5535_MASK:=0x0b000042
 
 CPU_TYPE := geode
